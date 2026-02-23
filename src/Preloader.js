@@ -19,7 +19,7 @@ export class Preloader {
             character: null,
             idle: null,
             run: null,
-            jump: null,
+            dash: null,
         };
     }
 
@@ -33,7 +33,7 @@ export class Preloader {
             { key: 'character', url: '/models/character.fbx' },
             { key: 'idle', url: '/models/Idle.fbx' },
             { key: 'run', url: '/models/Running.fbx' },
-            { key: 'jump', url: '/models/Running Jump.fbx' },
+            { key: 'dash', url: '/models/Dash.fbx' },
         ];
 
         const totalFiles = urls.length;

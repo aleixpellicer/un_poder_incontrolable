@@ -16,8 +16,9 @@ export class NetworkManager {
         });
         // Forward all server events to registered handlers
         [
-            'joined', 'playerJoined', 'playerLeft', 'gameState', 'respawn',
-            'lobbyState', 'matchStart', 'matchEnd', 'matchReset', 'eliminated'
+            'joined', 'playerJoined', 'playerLeft', 'gameState',
+            'killed', 'playerRespawned',
+            'powerUpSpawned', 'powerUpCollected', 'shieldBlocked'
         ].forEach(evt => {
             this.socket.on(evt, (data) => {
                 if (this.handlers[evt]) this.handlers[evt].forEach(fn => fn(data));
@@ -36,6 +37,12 @@ export class NetworkManager {
                 position: { x: position.x, y: position.y, z: position.z },
                 rotation
             });
+        }
+    }
+
+    requestRespawn() {
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('requestRespawn');
         }
     }
 }

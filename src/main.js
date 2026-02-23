@@ -34,7 +34,7 @@ preloader.loadAll().then(() => {
 
     // Enable the button
     joinBtn.disabled = false;
-    joinBtn.textContent = 'ENTRAR A LA ARENA';
+    joinBtn.textContent = '⚡ ENTRAR ⚡';
     if (progressTxt) progressTxt.textContent = '¡Listo!';
 
     // Fade out the progress bar
@@ -47,7 +47,7 @@ preloader.loadAll().then(() => {
     // Fallback: let user play anyway, assets will load on demand
     game = new Game();
     joinBtn.disabled = false;
-    joinBtn.textContent = 'ENTRAR A LA ARENA';
+    joinBtn.textContent = '⚡ ENTRAR ⚡';
     if (progressTxt) progressTxt.textContent = '¡Listo (parcial)!';
 });
 

@@ -4,9 +4,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>INCONTROLABLE — La Arena del Poder Incontrolable</title>
+  <title>INCONTROLABLE — Arena Infinita del Poder</title>
   <meta name="description"
-    content="Un juego de arena 3D multijugador donde tu poder se carga de forma incontrolable y dispara al jugador más cercano." />
+    content="Un juego de arena 3D multijugador infinito. Sobrevive el mayor tiempo posible mientras esquivas el poder incontrolable." />
   <link
     href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;500;700&display=swap"
     rel="stylesheet" />
@@ -19,10 +19,10 @@
     <div class="join-container">
       <div class="join-logo">⚡</div>
       <h1>INCONTROLABLE</h1>
-      <p class="join-subtitle">Tu poder se carga automáticamente y dispara al jugador más cercano.<br />¡Aléjate de
-        los jugadores cargados!</p>
+      <p class="join-subtitle">Arena infinita. Tu poder se carga y dispara al más cercano.<br />Sobrevive el mayor
+        tiempo posible. ¡Si mueres, renaces!</p>
       <input type="text" id="player-name" placeholder="Escribe tu nombre" maxlength="15" autocomplete="off" />
-      <button id="join-btn">ENTRAR A LA ARENA</button>
+      <button id="join-btn">ENTRAR</button>
       <div id="preload-container">
         <div id="preload-bar-bg">
           <div id="preload-bar"></div>
@@ -30,7 +30,7 @@
         <div id="preload-text">Cargando recursos…</div>
       </div>
       <div class="join-controls">
-        <span>WASD</span> Mover &nbsp;|&nbsp; <span>ESPACIO</span> Saltar &nbsp;|&nbsp; <span>RATÓN</span> Mirar
+        <span>WASD</span> Mover &nbsp;|&nbsp; <span>ESPACIO</span> Dash &nbsp;|&nbsp; <span>RATÓN</span> Mirar
       </div>
     </div>
   </div>
@@ -38,20 +38,24 @@
   <!-- Game HUD -->
   <div id="hud" style="display:none;">
 
-    <!-- Lobby Screen -->
-    <div id="lobby-screen" style="display:none;">
-      <div class="lobby-container">
-        <div class="lobby-title">⚡ ESPERANDO JUGADORES ⚡</div>
-        <div class="lobby-timer">La partida comienza en <span id="lobby-countdown">30</span>s</div>
-        <div id="lobby-players" class="lobby-players-list"></div>
-        <div class="lobby-hint">Se añadirán bots para completar los 10 jugadores</div>
+    <!-- FPS / Performance Counter -->
+    <div id="fps-counter">
+      <div class="fps-row fps-current"><span class="fps-label">FPS</span><span id="fps-current"
+          class="fps-value">0</span></div>
+      <div class="fps-row fps-ms"><span class="fps-label">MS</span><span id="fps-ms" class="fps-value">0</span></div>
+      <div class="fps-divider"></div>
+      <div class="fps-row fps-low"><span class="fps-label">MIN</span><span id="fps-min" class="fps-value">—</span></div>
+      <div class="fps-row fps-high"><span class="fps-label">MAX</span><span id="fps-max" class="fps-value">—</span>
+      </div>
+      <div class="fps-divider"></div>
+      <div class="fps-row fps-ping"><span class="fps-label">PING</span><span id="fps-ping" class="fps-value">—</span>
       </div>
     </div>
 
-    <!-- Alive counter (during match) -->
+    <!-- Alive counter -->
     <div id="alive-counter" style="display:none;">
       <span class="alive-icon">👤</span>
-      <span class="alive-text">10 / 10</span>
+      <span class="alive-text">0 / 0</span>
     </div>
 
     <div id="charge-container">
@@ -64,37 +68,36 @@
 
     <div id="charge-warning">⚠ Alguien está cargando el rayo…</div>
 
+    <div id="shield-indicator" style="display:none;">
+      <span class="shield-icon">🛡️</span>
+      <span class="shield-label">ESCUDO</span>
+      <span id="shield-timer" class="shield-time">30s</span>
+    </div>
+
     <div id="targeted-warning" style="display:none;">⚠ ¡Te están apuntando! Muévete</div>
+
+    <div id="spawn-protection-banner" style="display:none;">
+      <div class="sp-shield">🛡️</div>
+      <div class="sp-text">PROTECCIÓN ACTIVA</div>
+      <div class="sp-timer">5s</div>
+      <div class="sp-hint">¡Aléjate del peligro!</div>
+    </div>
 
     <div id="message-box"></div>
 
     <div id="scoreboard"></div>
 
-    <div id="instructions">WASD / Flechas — Mover &bull; ESPACIO — Saltar &bull; ¡Último en pie gana!</div>
+    <div id="instructions">WASD / Flechas — Mover &bull; ESPACIO — Dash &bull; ¡Sobrevive todo lo que puedas!</div>
 
-    <!-- Death/eliminated screen (no respawn) -->
-    <div id="death-screen" style="display:none;">
-      <div class="death-text">HAS SIDO ELIMINADO</div>
-      <div class="death-sub">Observando la partida…</div>
-    </div>
-
-    <!-- Eliminated screen with placement -->
-    <div id="eliminated-screen" style="display:none;">
-      <div class="eliminated-container">
-        <div class="eliminated-title">💀 ELIMINADO</div>
-        <div class="eliminated-placement" id="eliminated-placement">#5 / 10</div>
-        <div class="eliminated-by">Eliminado por <span id="eliminated-killer">Bot Alfa</span></div>
-        <div class="eliminated-hint">Observando la partida…</div>
-      </div>
-    </div>
-
-    <!-- Winner screen -->
-    <div id="winner-screen" style="display:none;">
-      <div class="winner-container">
-        <div class="winner-crown">🏆</div>
-        <div class="winner-title">¡VICTORIA!</div>
-        <div class="winner-name" id="winner-name">Jugador</div>
-        <div class="winner-sub" id="winner-restart-text">Nueva partida en breve…</div>
+    <!-- Death / Respawn overlay -->
+    <div id="death-overlay" style="display:none;">
+      <div class="death-container">
+        <div class="death-skull">💀</div>
+        <div class="death-title">¡ELIMINADO!</div>
+        <div class="death-by">Eliminado por <span id="death-killer" class="death-killer-name">???</span></div>
+        <div class="death-survived">Sobreviviste <span id="death-survival-time" class="death-time">0s</span></div>
+        <div id="death-countdown" class="death-countdown">Renacimiento en 4s...</div>
+        <button id="respawn-btn" class="respawn-btn" style="display:none;">⚡ RENACER ⚡</button>
       </div>
     </div>
 

@@ -6,6 +6,7 @@ import { HUD } from './HUD.js';
 import { PlayerModel } from './PlayerModel.js';
 import { PowerEffect } from './PowerEffect.js';
 import { ChargingBeam } from './ChargingBeam.js';
+import { DashDust } from './DashDust.js';
 
 export class Game {
     constructor(cachedAssets) {
@@ -18,6 +19,8 @@ export class Game {
         this.remotes = new Map();       // id → { model, targetPos, data }
         this.effects = [];              // PowerEffect[]
         this.chargingBeam = null;       // ChargingBeam (live preview)
+        this.dashDust = null;           // DashDust particle system
+        this._wasDashing = false;       // track dash start for burst emit
         this.chargeState = { chargedPlayerId: null, chargePct: 0 };
         this._isTargeted = false;       // whether local player is the nearest target
         this.clock = new THREE.Clock();
@@ -29,15 +32,151 @@ export class Game {
         /** Arena cover boxes (from server) */
         this.arenaBoxes = [];
 
-        /** Match state tracking */
-        this.matchState = 'lobby';
-        this.isEliminated = false;
+        /** Player state */
+        this.isAlive = true;
         this.localPlayerData = null;
+
+        /** Spawn protection tracking */
+        this._hasSpawnProtection = false;
+
+        /** FPS tracking */
+        this._fpsFrames = 0;
+        this._fpsAccum = 0;
+        this._fpsCurrent = 0;
+        this._fpsMin = Infinity;
+        this._fpsMax = 0;
+        this._fpsWarmup = 2; // seconds to skip before tracking min/max
+        this._ping = 0;     // server latency in ms
+
+        /** Reusable Vector3 to reduce GC pressure in _onState */
+        this._tmpVec3 = new THREE.Vector3();
+
+        /** Throttle leaderboard DOM rebuilds (max 2x/sec) */
+        this._leaderboardThrottle = 0;
+        this._leaderboardInterval = 0.5; // seconds between rebuilds
+
+        /** Queue for staggering name sprite rebuilds across frames */
+        this._pendingNameUpdates = [];
+        this._nameUpdatesPerFrame = 2; // max sprites rebuilt per frame
+
+        /** Serialise _addRemote calls to avoid concurrent heavy cloning */
+        this._addRemoteQueue = [];
+        this._addRemoteRunning = false;
+
+        /** PowerEffect object pool (pre-created, reused) */
+        this._effectPool = [];
+        this._effectPoolSize = 4;
+
+        /** Whether the render loop is already running */
+        this._loopRunning = false;
     }
 
     /* ── Bootstrap ─────────────────────────────── */
     preInitScene() {
         this.scene.init();
+        // Pre-create persistent objects and warm all shaders with real render passes
+        this._warmUpGPU();
+    }
+
+    /**
+     * Full GPU warm-up: pre-creates persistent game objects (ChargingBeam,
+     * DashDust, PowerEffect pool) and does actual render passes to force
+     * the GPU driver to fully compile and cache every shader pipeline.
+     *
+     * `renderer.compile()` alone is not enough on many drivers — they
+     * still defer actual machine-code generation until the first real draw.
+     * So we render the scene twice with all materials visible.
+     */
+    _warmUpGPU() {
+        const scene = this.scene.scene;
+        const camera = this.scene.camera;
+        const renderer = this.scene.renderer;
+        if (!renderer || !scene || !camera) return;
+
+        const tempDummies = []; // things we remove after warm-up
+
+        try {
+            // ── 1. Pre-create ChargingBeam (persists for the whole game) ──
+            this.chargingBeam = new ChargingBeam();
+            scene.add(this.chargingBeam.group);
+            // Make it visible for the warm-up render
+            const dummyFrom = new THREE.Vector3(0, 1, 0);
+            const dummyTo = new THREE.Vector3(3, 1, 3);
+            this.chargingBeam.update(dummyFrom, dummyTo, 0.5);
+
+            // ── 2. Pre-create DashDust (persists for the whole game) ──
+            this.dashDust = new DashDust();
+            scene.add(this.dashDust.group);
+            // Emit a dummy burst so the material gets compiled
+            this.dashDust.emit(dummyFrom, new THREE.Vector3(1, 0, 0));
+
+            // ── 3. Pre-create PowerEffect pool (reused during gameplay) ──
+            for (let i = 0; i < this._effectPoolSize; i++) {
+                const fx = new PowerEffect(dummyFrom, dummyTo, i % 2 === 0 ? '#ff4466' : '#00ffc8');
+                fx.group.visible = true;  // visible for the warm-up render
+                scene.add(fx.group);
+                this._effectPool.push(fx);
+            }
+
+            // ── 4. Temporary PlayerModel with shield to warm those shaders ──
+            if (this.cachedAssets) {
+                const pm = PlayerModel.loadFromCache('#ff4466', this.cachedAssets);
+                pm.setShield(true);
+                pm.shieldSphere.visible = true;
+                pm.shieldSphere.material.uniforms.uOpacity.value = 1;
+                pm.mesh.position.set(0, 0, 0);
+                scene.add(pm.mesh);
+                tempDummies.push({ group: pm.mesh, dispose: () => pm.dispose() });
+            }
+
+            // ── 5. Force compile + ACTUAL RENDER PASS (this is the key!) ──
+            renderer.compile(scene, camera);
+            renderer.render(scene, camera);
+            // Second render to ensure all deferred GPU work is done
+            renderer.render(scene, camera);
+
+        } catch (e) {
+            console.warn('GPU warm-up error (non-fatal):', e);
+        }
+
+        // ── Clean up temp dummies (PlayerModel) ──
+        for (const d of tempDummies) {
+            scene.remove(d.group);
+            try { d.dispose(); } catch (_) { /* ok */ }
+        }
+
+        // ── Hide the pre-created objects until the game actually starts ──
+        this.chargingBeam.hide();
+
+        // Clean up the DashDust warm-up particles
+        this.dashDust.update(10); // advance far enough to kill all particles
+
+        // Hide and reset all pooled PowerEffects
+        for (const fx of this._effectPool) {
+            fx.group.visible = false;
+            scene.remove(fx.group);
+        }
+
+        // Clear the canvas so the user doesn't see the warm-up frame
+        renderer.clear();
+    }
+
+    /**
+     * Get a PowerEffect from the pool, or create a new one if pool is empty.
+     * Pool objects are recycled when their animation completes.
+     */
+    _spawnEffect(from, to, color) {
+        let fx;
+        if (this._effectPool.length > 0) {
+            // Reuse from pool: dispose old state, re-init
+            fx = this._effectPool.pop();
+            this.scene.scene.remove(fx.group);
+            fx.dispose();
+        }
+        // Create fresh (either pool was empty, or we recycled)
+        fx = new PowerEffect(from, to, color);
+        this.scene.scene.add(fx.group);
+        this.effects.push(fx);
     }
 
     start(name) {
@@ -47,39 +186,84 @@ export class Game {
 
         this.network.on('joined', async (d) => {
             this.localId = d.id;
-            this.matchState = d.matchState || 'lobby';
+            this.isAlive = true;
 
+            // ── Step 1: Create the local player (highest priority) ──
             const model = this.cachedAssets
                 ? PlayerModel.loadFromCache(d.player.color, this.cachedAssets)
                 : await PlayerModel.load(d.player.color);
             model.setName(d.player.name);
+            model.setLocalPlayer(true);  // blue ground circle indicator
             this.scene.scene.add(model.mesh);
 
             this.ctrl = new PlayerController(model);
             this.ctrl.position.set(d.player.position.x, d.player.position.y, d.player.position.z);
 
+            // If spawning in the sky, start falling
+            if (d.player.position.y > 0) {
+                this.ctrl.startFalling();
+                this.ctrl.model.mesh.position.copy(this.ctrl.position);
+            }
+
+            // ── Step 2: ChargingBeam + DashDust already pre-created in _warmUpGPU ──
+            // Just make sure they're in the scene (they should be already)
+            if (!this.chargingBeam.group.parent) {
+                this.scene.scene.add(this.chargingBeam.group);
+            }
+            if (!this.dashDust.group.parent) {
+                this.scene.scene.add(this.dashDust.group);
+            }
+
+            // ── Step 3: Start the render loop IMMEDIATELY ──
+            // The player sees themselves right away, remotes load in the background
+            if (!this._loopRunning) {
+                this._loopRunning = true;
+                this._loop();
+            }
+
+            // ── Step 4: Build arena (spread across next frame) ──
+            await new Promise(r => requestAnimationFrame(r));
+            this.arenaBoxes = d.arenaBoxes || [];
+            this.scene.buildBoxes(this.arenaBoxes);
+
+            // ── Step 5: Power-ups (next frame) ──
+            await new Promise(r => requestAnimationFrame(r));
+            if (d.powerUps) {
+                for (const pu of d.powerUps) {
+                    this.scene.addPowerUp(pu);
+                }
+            }
+
+            // ── Step 6: Remote players (staggered via the queue) ──
             for (const [id, p] of Object.entries(d.players)) {
                 if (id !== this.localId) this._addRemote(id, p);
             }
 
-            this.chargingBeam = new ChargingBeam();
-            this.scene.scene.add(this.chargingBeam.group);
-
-            this.arenaBoxes = d.arenaBoxes || [];
-            this.scene.buildBoxes(this.arenaBoxes);
-
-            // If we joined during lobby, show lobby screen
-            if (this.matchState === 'lobby') {
-                this.hud.showLobby(d.lobbyCountdown || 30, Object.keys(d.players).length, 10, d.players);
+            // Show initial spawn protection
+            if (d.player.spawnProtection > 0) {
+                this._hasSpawnProtection = true;
+                this.hud.showSpawnProtection(d.player.spawnProtection);
+                this.hud.showMessage('🛡️ ¡Protección activa! ¡Aléjate del peligro!', 3000);
             }
+        });
 
-            this._loop();
+        // ── Ping measurement (every 2s) ─────────
+        this.network.on('joined', () => {
+            this._pingInterval = setInterval(() => {
+                if (this.network.socket && this.network.socket.connected) {
+                    const start = performance.now();
+                    this.network.socket.volatile.emit('clientPing', null, () => {
+                        this._ping = Math.round(performance.now() - start);
+                        this.hud.updatePing(this._ping);
+                    });
+                }
+            }, 2000);
         });
 
         this.network.on('playerJoined', (p) => {
             if (p.id !== this.localId) {
                 this._addRemote(p.id, p);
-                this.hud.showMessage(`${p.name} se unió`, 2000);
+                this.hud.showMessage(`${p.name} entró a la arena`, 2000);
             }
         });
 
@@ -95,124 +279,105 @@ export class Game {
 
         this.network.on('gameState', (s) => this._onState(s));
 
-        /* ── Lobby state updates ────────────────── */
-        this.network.on('lobbyState', (s) => {
-            this.matchState = 'lobby';
-            this.hud.showLobby(s.countdown, s.filledSlots, s.totalSlots, s.players);
-
-            // Update remote players positions during lobby
-            for (const [id, pd] of Object.entries(s.players)) {
-                if (id === this.localId) continue;
-                const r = this.remotes.get(id);
-                if (!r) {
-                    // New player joined mid-lobby
-                    this._addRemote(id, pd);
-                }
-            }
+        /* ── Killed (can respawn) ─────────────────── */
+        this.network.on('killed', (data) => {
+            this.isAlive = false;
+            this.hud.showDeathScreen(data.killedBy, data.survivalTime, data.respawnIn);
         });
 
-        /* ── Match Start ────────────────────────── */
-        this.network.on('matchStart', (data) => {
-            this.matchState = 'playing';
-            this.isEliminated = false;
-            this.hud.hideLobby();
-            this.hud.hideWinner();
-            this.hud.hideEliminated();
-
-            // Update arena boxes
-            this.arenaBoxes = data.arenaBoxes || [];
-            this.scene.buildBoxes(this.arenaBoxes);
-
-            // Reposition all players
-            for (const [id, pd] of Object.entries(data.players)) {
-                if (id === this.localId && this.ctrl) {
-                    this.ctrl.position.set(pd.position.x, pd.position.y, pd.position.z);
+        /* ── Player respawned ─────────────────────── */
+        this.network.on('playerRespawned', (p) => {
+            if (p.id === this.localId) {
+                // Local player respawned
+                this.isAlive = true;
+                this.hud.hideDeathScreen();
+                if (this.ctrl) {
+                    this.ctrl.position.set(p.position.x, p.position.y, p.position.z);
                     this.ctrl.velocity.set(0, 0, 0);
                     this.ctrl.model.mesh.position.copy(this.ctrl.position);
-                } else {
-                    const r = this.remotes.get(id);
-                    if (r) {
-                        r.targetPos = new THREE.Vector3(pd.position.x, pd.position.y, pd.position.z);
-                        r.model.mesh.position.set(pd.position.x, pd.position.y, pd.position.z);
-                        r.data = pd;
-                        r.model.setAlive(true);
+                    this.ctrl.model.setAlive(true);
+                    // Fall from the sky on respawn
+                    if (p.position.y > 0) {
+                        this.ctrl.startFalling();
                     }
                 }
-            }
-
-            this.hud.showMessage('⚔️ ¡LA PARTIDA HA COMENZADO!', 3000);
-            this.scene.shake(0.5, 0.5);
-        });
-
-        /* ── Match End (winner declared) ────────── */
-        this.network.on('matchEnd', (data) => {
-            this.matchState = 'ended';
-            this.hud.showWinner(data.winner);
-            if (data.winner && data.winner.id === this.localId) {
-                this.hud.showMessage('🏆 ¡ERES EL GANADOR! 🏆', 5000);
-            }
-        });
-
-        /* ── Match Reset ────────────────────────── */
-        this.network.on('matchReset', (data) => {
-            this.matchState = 'lobby';
-            this.isEliminated = false;
-            this.hud.hideWinner();
-            this.hud.hideEliminated();
-            this.hud.hideAliveCount();
-
-            // Remove all remote models (bots will be re-added)
-            for (const [id, r] of this.remotes) {
-                this.scene.scene.remove(r.model.mesh);
-                r.model.dispose();
-            }
-            this.remotes.clear();
-
-            // Re-add current players
-            for (const [id, pd] of Object.entries(data.players)) {
-                if (id === this.localId && this.ctrl) {
-                    this.ctrl.position.set(pd.position.x, pd.position.y, pd.position.z);
-                    this.ctrl.velocity.set(0, 0, 0);
-                    this.ctrl.model.mesh.position.copy(this.ctrl.position);
-                    // Update color
-                    this.ctrl.model.updateColor(pd.color);
-                } else {
-                    this._addRemote(id, pd);
+                this.hud.showMessage('🔄 ¡Cayendo del cielo! 🛡️ Protección activa', 3000);
+                this._hasSpawnProtection = true;
+            } else {
+                const r = this.remotes.get(p.id);
+                if (r) {
+                    r.targetPos = new THREE.Vector3(p.position.x, p.position.y, p.position.z);
+                    r.model.mesh.position.set(p.position.x, p.position.y, p.position.z);
+                    r.data = p;
+                    r.model.setAlive(true);
                 }
             }
-
-            this.hud.showLobby(data.lobbyCountdown, Object.keys(data.players).length, 10, data.players);
-            this.hud.showMessage('🔄 Nueva partida en breve...', 3000);
         });
 
-        /* ── Eliminated (no respawn) ────────────── */
-        this.network.on('eliminated', (data) => {
-            this.isEliminated = true;
-            this.hud.showEliminated(data.placement, data.totalPlayers, data.killedBy);
+        /* ── Respawn request (button click) ──────── */
+        this.hud.onRespawnClick(() => {
+            this.network.requestRespawn();
         });
 
-        // Remove old respawn handler — no more respawning
-        this.network.on('respawn', () => {
-            // No-op in battle royale mode
+        /* ── Power-up events ──────────────────────── */
+        this.network.on('powerUpSpawned', (pu) => {
+            this.scene.addPowerUp(pu);
+        });
+
+        this.network.on('powerUpCollected', (data) => {
+            this.scene.removePowerUp(data.powerUpId);
+            if (data.playerId === this.localId) {
+                this.hud.showMessage('🛡️ ¡ESCUDO DE DEFENSA ACTIVADO!', 3000);
+                this.scene.shake(0.25, 0.2);
+            } else {
+                this.hud.showMessage(`🛡️ ${data.playerName} recogió un escudo`, 2000);
+            }
+        });
+
+        this.network.on('shieldBlocked', (data) => {
+            this.hud.showMessage(`🛡️ ¡Tu escudo bloqueó el rayo de ${data.attackerName}!`, 3000);
+            this.scene.shake(0.5, 0.4);
         });
     }
 
     /* ── Remote helpers ────────────────────────── */
-    async _addRemote(id, data) {
-        const model = this.cachedAssets
-            ? PlayerModel.loadFromCache(data.color, this.cachedAssets)
-            : await PlayerModel.load(data.color);
-        model.setName(data.name);
-        model.setAlive(data.alive);
-        this.scene.scene.add(model.mesh);
-        model.mesh.position.set(data.position.x, data.position.y, data.position.z);
-        this.remotes.set(id, { model, targetPos: null, data, prevPos: null });
+    _addRemote(id, data) {
+        // If already queued or already exists, skip
+        if (this.remotes.has(id)) return;
+        if (this._addRemoteQueue.some(q => q.id === id)) return;
+
+        this._addRemoteQueue.push({ id, data });
+        this._processRemoteQueue();
+    }
+
+    async _processRemoteQueue() {
+        if (this._addRemoteRunning) return;
+        this._addRemoteRunning = true;
+
+        while (this._addRemoteQueue.length > 0) {
+            const { id, data } = this._addRemoteQueue.shift();
+
+            // Double-check it hasn't been added while waiting
+            if (this.remotes.has(id)) continue;
+
+            // Yield to let the renderer breathe between heavy clones
+            await new Promise(r => requestAnimationFrame(r));
+
+            const model = this.cachedAssets
+                ? PlayerModel.loadFromCache(data.color, this.cachedAssets)
+                : await PlayerModel.load(data.color);
+            model.setName(data.name);
+            model.setAlive(data.alive);
+            this.scene.scene.add(model.mesh);
+            model.mesh.position.set(data.position.x, data.position.y, data.position.z);
+            this.remotes.set(id, { model, targetPos: null, data, prevPos: null });
+        }
+
+        this._addRemoteRunning = false;
     }
 
     /* ── State sync ────────────────────────────── */
     _onState(state) {
-        if (state.matchState) this.matchState = state.matchState;
-
         const chargedPlayerId = state.chargedPlayerId;
         const chargePct = state.chargeDuration > 0
             ? Math.min(state.chargeTimer / state.chargeDuration, 1)
@@ -233,31 +398,53 @@ export class Game {
             if (id === this.localId) {
                 this.localPlayerData = pd;
                 this.hud.updateLocalPlayer(pd, isCharged, chargePct);
+                this.hud.updateShieldStatus(pd.defenseShield || 0);
                 if (this.ctrl) {
                     this.ctrl.model.updateCharge(playerCharge, isCharged);
+                    this.ctrl.model.setAlive(pd.alive);
+                    this.ctrl.model.setShield(pd.defenseShield > 0);
+                }
+                // Update death screen countdown
+                if (!pd.alive && pd.respawnTimer > 0) {
+                    this.hud.updateRespawnCountdown(pd.respawnTimer);
+                } else if (!pd.alive && pd.respawnTimer <= 0) {
+                    this.hud.showRespawnReady();
+                }
+
+                // Update spawn protection banner
+                if (pd.alive && pd.spawnProtection > 0) {
+                    this._hasSpawnProtection = true;
+                    this.hud.showSpawnProtection(pd.spawnProtection);
+                } else if (this._hasSpawnProtection) {
+                    this._hasSpawnProtection = false;
+                    this.hud.hideSpawnProtection();
+                    if (pd.alive) {
+                        this.hud.showMessage('⚠ ¡Protección terminada! ¡Cuidado!', 2500);
+                    }
                 }
                 continue;
             }
 
             const r = this.remotes.get(id);
             if (r) {
-                const newPos = new THREE.Vector3(pd.position.x, pd.position.y, pd.position.z);
+                this._tmpVec3.set(pd.position.x, pd.position.y, pd.position.z);
 
                 if (r.targetPos) {
-                    const dist = r.targetPos.distanceTo(newPos);
+                    const dist = r.targetPos.distanceTo(this._tmpVec3);
                     if (dist > 0.05) {
                         r.model.play('run');
                     } else {
                         r.model.play('idle');
                     }
+                    r.targetPos.copy(this._tmpVec3);
+                } else {
+                    r.targetPos = new THREE.Vector3(pd.position.x, pd.position.y, pd.position.z);
                 }
-
-                r.targetPos = newPos;
                 r.data = pd;
                 r.model.updateCharge(playerCharge, isCharged);
                 r.model.setAlive(pd.alive);
+                r.model.setShield(pd.defenseShield > 0);
             } else {
-                // Player exists on server but not on client — add them
                 this._addRemote(id, pd);
             }
         }
@@ -290,7 +477,16 @@ export class Game {
                     isLocal ? 0.5 : 0.3
                 );
 
-                if (ev.targetId === this.localId) {
+                if (ev.shieldBlocked) {
+                    // Shield block — different visual/messages
+                    if (ev.targetId === this.localId) {
+                        this.hud.showMessage(`🛡️ ¡Tu escudo absorbió el rayo de ${ev.shooterName}!`, 3000);
+                    } else if (ev.shooterId === this.localId) {
+                        this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó tu rayo con su escudo`, 2500);
+                    } else {
+                        this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó el rayo con su escudo`, 2000);
+                    }
+                } else if (ev.targetId === this.localId) {
                     this.hud.showMessage(`⚡ ¡ELIMINADO por ${ev.shooterName}!`, 2500);
                 } else if (ev.shooterId === this.localId) {
                     this.hud.showMessage(`⚡ ¡RAYO eliminó a ${ev.targetName}!`, 2000);
@@ -300,11 +496,51 @@ export class Game {
             }
         }
 
-        this.hud.updateScoreboard(state.players);
+        // Throttled leaderboard DOM rebuild (max 2x/sec instead of 20x/sec)
+        this._leaderboardThrottle -= 1 / 20; // approximate dt at tick rate
+        if (this._leaderboardThrottle <= 0) {
+            this._leaderboardThrottle = this._leaderboardInterval;
+            this.hud.updateLeaderboard(state.players);
+        }
 
-        if (state.arenaBoxes && this.arenaBoxes.length === 0) {
+        // Sync power-ups from server state
+        if (state.powerUps) {
+            this.scene.syncPowerUps(state.powerUps);
+        }
+
+        // ── Update 3D name sprites with rank badges ──
+        // Queue changed ranks; process a few per frame to avoid stalls
+        const sorted = Object.entries(state.players).sort(([, a], [, b]) => {
+            if (a.alive && !b.alive) return -1;
+            if (!a.alive && b.alive) return 1;
+            if (a.alive && b.alive) return b.survivalTime - a.survivalTime;
+            return b.bestSurvivalTime - a.bestSurvivalTime;
+        });
+        let rankIdx = 0;
+        for (const [id, pd] of sorted) {
+            rankIdx++;
+            if (id === this.localId) {
+                if (this.ctrl && this.ctrl.model) {
+                    const prevRank = this.ctrl.model._currentRank;
+                    if (prevRank !== rankIdx) {
+                        this._pendingNameUpdates.push({ model: this.ctrl.model, name: pd.name, rank: rankIdx });
+                    }
+                }
+            } else {
+                const r = this.remotes.get(id);
+                if (r && r.model) {
+                    const prevRank = r.model._currentRank;
+                    if (prevRank !== rankIdx) {
+                        this._pendingNameUpdates.push({ model: r.model, name: pd.name, rank: rankIdx });
+                    }
+                }
+            }
+        }
+
+        // Sync arena box positions from server
+        if (state.arenaBoxes) {
             this.arenaBoxes = state.arenaBoxes;
-            this.scene.buildBoxes(this.arenaBoxes);
+            this.scene.updateBoxTargets(this.arenaBoxes);
         }
     }
 
@@ -313,20 +549,65 @@ export class Game {
         requestAnimationFrame(() => this._loop());
         const dt = this.clock.getDelta();
 
+        // ── Process pending name sprite rebuilds (staggered) ──
+        if (this._pendingNameUpdates.length > 0) {
+            const batch = this._pendingNameUpdates.splice(0, this._nameUpdatesPerFrame);
+            for (const upd of batch) {
+                upd.model.setNameWithRank(upd.name, upd.rank);
+            }
+        }
+
+        // ── FPS measurement ─────────────────────
+        this._fpsFrames++;
+        this._fpsAccum += dt;
+        if (this._fpsWarmup > 0) {
+            this._fpsWarmup -= dt;
+        }
+        if (this._fpsAccum >= 0.5) {
+            this._fpsCurrent = Math.round(this._fpsFrames / this._fpsAccum);
+            const ms = (this._fpsAccum / this._fpsFrames) * 1000; // avg frame time
+            if (this._fpsWarmup <= 0) {
+                if (this._fpsCurrent < this._fpsMin) this._fpsMin = this._fpsCurrent;
+                if (this._fpsCurrent > this._fpsMax) this._fpsMax = this._fpsCurrent;
+            }
+            this.hud.updateFPS(this._fpsCurrent, ms, this._fpsMin, this._fpsMax);
+            this._fpsFrames = 0;
+            this._fpsAccum = 0;
+        }
+
         // Local player
         if (this.ctrl) {
-            // Only allow movement during active play (not lobby, not eliminated, not ended)
-            const canMove = this.matchState === 'playing' && !this.isEliminated;
+            const canMove = this.isAlive;
+            const isFalling = this.ctrl.isFalling;
+            const wasLanding = this.ctrl._isLanding;
 
             if (canMove) {
                 this.ctrl.update(dt);
+
+                // Camera shake on landing impact
+                if (wasLanding === false && this.ctrl._isLanding) {
+                    // Just landed!
+                    this.scene.shake(0.5, 0.4);
+                }
+
+                // ── Dash dust particles (skip while falling) ──
+                if (this.dashDust && !isFalling) {
+                    const isDashing = this.ctrl._isDashing;
+                    if (isDashing && !this._wasDashing) {
+                        // Dash just started — big burst
+                        this.dashDust.emit(this.ctrl.position, this.ctrl._dashDir);
+                    } else if (isDashing) {
+                        // Ongoing dash — trail particles
+                        this.dashDust.emitTrail(this.ctrl.position, this.ctrl._dashDir, this.ctrl._dashProgress);
+                    }
+                    this._wasDashing = isDashing;
+                }
             } else {
-                // Still tick animation but don't process input
                 this.ctrl.model.play('idle');
             }
 
-            // Client-side collision against remote players
-            if (canMove) {
+            // Client-side collision against remote players (skip while falling)
+            if (canMove && !this.ctrl.isFalling) {
                 const PLAYER_RADIUS = 1.0;
                 const minDist = PLAYER_RADIUS * 2;
                 for (const [, r] of this.remotes) {
@@ -354,7 +635,10 @@ export class Game {
 
             // Drive animation from movement state
             if (canMove) {
-                this.ctrl.model.play(this.ctrl.moveState);
+                let animState = this.ctrl.moveState;
+                if (animState === 'falling') animState = 'idle'; // play idle anim while falling
+                if (animState === 'dash' && !this.ctrl.model.actions.dash) animState = 'run';
+                this.ctrl.model.play(animState);
             }
 
             // Tick animation mixer
@@ -370,12 +654,16 @@ export class Game {
             }
         }
 
-        // Interpolate remotes & tick their animations
+        // Interpolate remotes & tick their animations (skip dead players)
         for (const [, r] of this.remotes) {
+            if (r.data && !r.data.alive) continue; // dead players are invisible
             if (r.targetPos) r.model.mesh.position.lerp(r.targetPos, 0.15);
             if (r.data) r.model.mesh.rotation.y = r.data.rotation || 0;
             r.model.tick(dt);
         }
+
+        // Dash dust
+        if (this.dashDust) this.dashDust.update(dt);
 
         // Power effects
         for (let i = this.effects.length - 1; i >= 0; i--) {
@@ -389,7 +677,7 @@ export class Game {
         }
 
         // Charging beam preview
-        if (this.chargingBeam && this.matchState === 'playing') {
+        if (this.chargingBeam) {
             const { chargedPlayerId, chargePct } = this.chargeState;
             let localIsTargeted = false;
 
@@ -410,6 +698,7 @@ export class Game {
                     for (const [id, r] of this.remotes) {
                         if (id === chargedPlayerId) continue;
                         if (r.data && !r.data.alive) continue;
+                        if (r.data && r.data.spawnProtection > 0) continue; // skip protected players
                         const pos = r.model.mesh.position;
                         if (!this._hasLineOfSight(chargedPos, pos)) continue;
                         const dx = pos.x - chargedPos.x;
@@ -422,7 +711,7 @@ export class Game {
                         }
                     }
 
-                    if (chargedPlayerId !== this.localId && this.ctrl) {
+                    if (chargedPlayerId !== this.localId && this.ctrl && this.isAlive && !this._hasSpawnProtection) {
                         const pos = this.ctrl.model.mesh.position;
                         if (this._hasLineOfSight(chargedPos, pos)) {
                             const dx = pos.x - chargedPos.x;
@@ -443,7 +732,6 @@ export class Game {
                         to.y += 1.0;
                         this.chargingBeam.update(from, to, chargePct);
 
-                        // Detect if local player is the target
                         if (nearestIsLocal && chargedPlayerId !== this.localId) {
                             localIsTargeted = true;
                         }
@@ -475,6 +763,12 @@ export class Game {
                 this.hud.hideTargetedWarning();
             }
         }
+
+        // Smoothly interpolate arena box visuals
+        this.scene.lerpBoxes(dt);
+
+        // Animate power-ups
+        this.scene.updatePowerUps(dt);
 
         this.scene.render();
     }

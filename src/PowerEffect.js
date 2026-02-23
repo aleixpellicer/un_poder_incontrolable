@@ -101,11 +101,47 @@ const shockwaveFragmentShader = /* glsl */`
 `;
 
 
+/* ── Shared geometry cache (created once, reused by all instances) ── */
+let _sharedSparkGeo = null;
+let _sharedFlashGeo = null;
+let _sharedDistortGeo = null;
+let _sharedRingGeo = null;
+
+function getSharedSparkGeo() {
+    if (!_sharedSparkGeo) _sharedSparkGeo = new THREE.SphereGeometry(0.08, 4, 4);
+    return _sharedSparkGeo;
+}
+function getSharedFlashGeo() {
+    if (!_sharedFlashGeo) _sharedFlashGeo = new THREE.SphereGeometry(0.5, 8, 8);
+    return _sharedFlashGeo;
+}
+function getSharedDistortGeo() {
+    if (!_sharedDistortGeo) _sharedDistortGeo = new THREE.SphereGeometry(1.2, 16, 16);
+    return _sharedDistortGeo;
+}
+function getSharedRingGeo() {
+    if (!_sharedRingGeo) _sharedRingGeo = new THREE.PlaneGeometry(6, 6);
+    return _sharedRingGeo;
+}
+
+
 /**
  * Animated energy BEAM that strikes instantly from shooter → target.
  * A bright laser-like beam with a see-through distortion explosion on impact.
+ *
+ * Performance optimizations:
+ * - Shared geometries across all instances (no per-fire allocations)
+ * - InstancedMesh for sparks (12 sparks = 1 draw call instead of 12)
+ * - Reduced polygon counts on decorative spheres
+ * - Reusable temporary math objects
  */
 export class PowerEffect {
+    // Reusable math objects to avoid per-frame GC pressure
+    static _tmpMatrix = new THREE.Matrix4();
+    static _tmpPosition = new THREE.Vector3();
+    static _tmpScale = new THREE.Vector3();
+    static _tmpQuat = new THREE.Quaternion();
+
     constructor(from, to, color) {
         this.group = new THREE.Group();
         this.from = from.clone();
@@ -119,7 +155,7 @@ export class PowerEffect {
         const midpoint = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
 
         /* ── Main beam (cylinder) ─────────────────── */
-        const beamGeo = new THREE.CylinderGeometry(0.08, 0.08, length, 8, 1, true);
+        const beamGeo = new THREE.CylinderGeometry(0.08, 0.08, length, 6, 1, true);
         const beamMat = new THREE.MeshBasicMaterial({
             color: c,
             transparent: true,
@@ -137,7 +173,7 @@ export class PowerEffect {
         this.group.add(this.beam);
 
         /* ── Outer glow beam (wider, transparent) ──── */
-        const glowGeo = new THREE.CylinderGeometry(0.25, 0.25, length, 8, 1, true);
+        const glowGeo = new THREE.CylinderGeometry(0.25, 0.25, length, 6, 1, true);
         const glowMat = new THREE.MeshBasicMaterial({
             color: c,
             transparent: true,
@@ -152,7 +188,7 @@ export class PowerEffect {
         this.group.add(this.glowBeam);
 
         /* ── Wide halo beam (very faint) ───────────── */
-        const haloGeo = new THREE.CylinderGeometry(0.5, 0.5, length, 8, 1, true);
+        const haloGeo = new THREE.CylinderGeometry(0.5, 0.5, length, 6, 1, true);
         const haloMat = new THREE.MeshBasicMaterial({
             color: c,
             transparent: true,
@@ -172,7 +208,6 @@ export class PowerEffect {
         this.group.add(this.lightSource);
 
         /* ── Origin flash ────────────────────────── */
-        const originFlashGeo = new THREE.SphereGeometry(0.6, 12, 12);
         const originFlashMat = new THREE.MeshBasicMaterial({
             color: 0xffffff,
             transparent: true,
@@ -180,12 +215,12 @@ export class PowerEffect {
             depthWrite: false,
             blending: THREE.AdditiveBlending
         });
-        this.originFlash = new THREE.Mesh(originFlashGeo, originFlashMat);
+        this.originFlash = new THREE.Mesh(getSharedFlashGeo(), originFlashMat);
         this.originFlash.position.copy(from);
+        this.originFlash.scale.setScalar(1.2); // slightly bigger to match original 0.6 radius
         this.group.add(this.originFlash);
 
         /* ── Impact distortion sphere (see-through!) ─ */
-        const distortGeo = new THREE.SphereGeometry(1.2, 24, 24);
         const distortMat = new THREE.ShaderMaterial({
             uniforms: {
                 uColor: { value: c.clone() },
@@ -200,14 +235,13 @@ export class PowerEffect {
             side: THREE.DoubleSide,
             blending: THREE.AdditiveBlending
         });
-        this.distortSphere = new THREE.Mesh(distortGeo, distortMat);
+        this.distortSphere = new THREE.Mesh(getSharedDistortGeo(), distortMat);
         this.distortSphere.position.copy(to);
         this.group.add(this.distortSphere);
 
         /* ── Shockwave rings (multiple, expanding) ─── */
         this.shockwaves = [];
         for (let i = 0; i < 3; i++) {
-            const ringGeo = new THREE.PlaneGeometry(6, 6);
             const ringMat = new THREE.ShaderMaterial({
                 uniforms: {
                     uColor: { value: c.clone() },
@@ -221,7 +255,7 @@ export class PowerEffect {
                 side: THREE.DoubleSide,
                 blending: THREE.AdditiveBlending
             });
-            const ring = new THREE.Mesh(ringGeo, ringMat);
+            const ring = new THREE.Mesh(getSharedRingGeo(), ringMat);
             ring.position.copy(to);
             ring.rotation.x = -Math.PI / 2;
             ring.position.y = 0.1 + i * 0.05;
@@ -229,21 +263,21 @@ export class PowerEffect {
             this.shockwaves.push({ mesh: ring, delay: i * 0.08 });
         }
 
-        /* ── Energy sparks (small additive sprites) ── */
-        this.sparks = [];
+        /* ── Energy sparks (InstancedMesh — 1 draw call for all!) ── */
         const sparkCount = 12;
-        for (let i = 0; i < sparkCount; i++) {
-            const sparkGeo = new THREE.SphereGeometry(0.06 + Math.random() * 0.08, 6, 6);
-            const sparkMat = new THREE.MeshBasicMaterial({
-                color: c.clone().lerp(new THREE.Color(0xffffff), 0.5),
-                transparent: true,
-                opacity: 0.8,
-                depthWrite: false,
-                blending: THREE.AdditiveBlending
-            });
-            const spark = new THREE.Mesh(sparkGeo, sparkMat);
-            spark.position.copy(to);
+        const sparkMat = new THREE.MeshBasicMaterial({
+            color: c.clone().lerp(new THREE.Color(0xffffff), 0.5),
+            transparent: true,
+            opacity: 0.8,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        this.sparkInstanced = new THREE.InstancedMesh(getSharedSparkGeo(), sparkMat, sparkCount);
+        this.sparkInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.group.add(this.sparkInstanced);
 
+        this.sparkData = [];
+        for (let i = 0; i < sparkCount; i++) {
             // Random direction for each spark
             const angle = (Math.PI * 2 * i) / sparkCount + (Math.random() - 0.5) * 0.5;
             const elevation = (Math.random() - 0.3) * Math.PI * 0.6;
@@ -254,12 +288,24 @@ export class PowerEffect {
                 Math.sin(angle) * Math.cos(elevation) * speed
             );
 
-            this.group.add(spark);
-            this.sparks.push({ mesh: spark, velocity, life: 0.4 + Math.random() * 0.6 });
+            this.sparkData.push({
+                position: to.clone(),
+                velocity,
+                life: 0.4 + Math.random() * 0.6,
+                size: 0.6 + Math.random() * 1.0
+            });
+
+            // Set initial instance matrix
+            PowerEffect._tmpMatrix.compose(
+                to,
+                PowerEffect._tmpQuat.identity(),
+                PowerEffect._tmpScale.setScalar(this.sparkData[i].size)
+            );
+            this.sparkInstanced.setMatrixAt(i, PowerEffect._tmpMatrix);
         }
+        this.sparkInstanced.instanceMatrix.needsUpdate = true;
 
         /* ── Inner flash (very brief, small, additive) ── */
-        const flashGeo = new THREE.SphereGeometry(0.5, 12, 12);
         const flashMat = new THREE.MeshBasicMaterial({
             color: 0xffffff,
             transparent: true,
@@ -267,7 +313,7 @@ export class PowerEffect {
             depthWrite: false,
             blending: THREE.AdditiveBlending
         });
-        this.impactFlash = new THREE.Mesh(flashGeo, flashMat);
+        this.impactFlash = new THREE.Mesh(getSharedFlashGeo(), flashMat);
         this.impactFlash.position.copy(to);
         this.group.add(this.impactFlash);
 
@@ -293,7 +339,7 @@ export class PowerEffect {
 
         // Origin flash shrinks fast
         const originScale = Math.max(0, 1 - t * 3);
-        this.originFlash.scale.setScalar(originScale);
+        this.originFlash.scale.setScalar(originScale * 1.2);
         this.originFlash.material.opacity = originScale * 0.7;
 
         /* ── Distortion sphere — expands, wobbles, fades ── */
@@ -315,21 +361,41 @@ export class PowerEffect {
             sw.mesh.material.uniforms.uOpacity.value = Math.max(0, 0.45 * (1 - ringT));
         }
 
-        /* ── Energy sparks — fly outward with gravity ──── */
-        for (const spark of this.sparks) {
+        /* ── Energy sparks — fly outward with gravity (InstancedMesh) ── */
+        let anySparkVisible = false;
+        for (let i = 0; i < this.sparkData.length; i++) {
+            const spark = this.sparkData[i];
             if (this.age > spark.life) {
-                spark.mesh.visible = false;
+                // Hide by scaling to zero
+                PowerEffect._tmpMatrix.compose(
+                    spark.position,
+                    PowerEffect._tmpQuat.identity(),
+                    PowerEffect._tmpScale.setScalar(0)
+                );
+                this.sparkInstanced.setMatrixAt(i, PowerEffect._tmpMatrix);
                 continue;
             }
+            anySparkVisible = true;
             const sparkT = this.age / spark.life;
-            spark.mesh.position.x += spark.velocity.x * dt;
-            spark.mesh.position.y += spark.velocity.y * dt;
-            spark.mesh.position.z += spark.velocity.z * dt;
+            spark.position.x += spark.velocity.x * dt;
+            spark.position.y += spark.velocity.y * dt;
+            spark.position.z += spark.velocity.z * dt;
             spark.velocity.y -= 9.8 * dt; // gravity
-            spark.mesh.material.opacity = Math.max(0, 0.8 * (1 - sparkT));
-            const sparkScale = 1 + sparkT * 0.5;
-            spark.mesh.scale.setScalar(sparkScale);
+
+            const sparkScale = spark.size * (1 + sparkT * 0.5);
+            PowerEffect._tmpMatrix.compose(
+                spark.position,
+                PowerEffect._tmpQuat.identity(),
+                PowerEffect._tmpScale.setScalar(sparkScale)
+            );
+            this.sparkInstanced.setMatrixAt(i, PowerEffect._tmpMatrix);
         }
+        if (anySparkVisible) {
+            // Update opacity on the shared material
+            const avgT = this.age / 0.7; // approximate average life
+            this.sparkInstanced.material.opacity = Math.max(0, 0.8 * (1 - Math.min(avgT, 1)));
+        }
+        this.sparkInstanced.instanceMatrix.needsUpdate = true;
 
         /* ── Inner flash — very quick pop ───────────── */
         const flashT = Math.min(t * 5, 1); // completes in ~20% of total time
@@ -342,9 +408,22 @@ export class PowerEffect {
     }
 
     dispose() {
-        this.group.traverse(c => {
-            if (c.geometry) c.geometry.dispose();
-            if (c.material) c.material.dispose();
-        });
+        // Dispose only per-instance materials (not shared geometries)
+        this.beam.geometry.dispose(); // beam cylinders are unique per length
+        this.beam.material.dispose();
+        this.glowBeam.geometry.dispose();
+        this.glowBeam.material.dispose();
+        this.haloBeam.geometry.dispose();
+        this.haloBeam.material.dispose();
+        this.originFlash.material.dispose();
+        this.distortSphere.material.dispose();
+        this.impactFlash.material.dispose();
+        this.sparkInstanced.material.dispose();
+        this.sparkInstanced.dispose(); // dispose the InstancedMesh itself
+        for (const sw of this.shockwaves) {
+            sw.mesh.material.dispose();
+        }
+        // Note: shared geometries (_sharedSparkGeo etc.) are NOT disposed —
+        // they persist for the lifetime of the app and are reused.
     }
 }
