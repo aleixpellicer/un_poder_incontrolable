@@ -481,9 +481,169 @@ function getAlivePlayers() {
     return alive;
 }
 
+/**
+ * Calculate a cover position on the far side of a box, relative to a threat.
+ * Returns {x, z} — a point on the opposite side of the box from the threat,
+ * offset so the bot hugs the box edge without clipping inside it.
+ */
+function getCoverPosition(botPos, threatPos, box) {
+    // Direction from threat to box center
+    const dx = box.x - threatPos.x;
+    const dz = box.z - threatPos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz) || 1;
+    const nx = dx / dist;
+    const nz = dz / dist;
+
+    // Place the bot on the far side of the box, offset by half-box + player radius
+    const offsetDist = (BOX_SIZE / 2) + PLAYER_RADIUS + 0.3;
+    return {
+        x: box.x + nx * offsetDist,
+        z: box.z + nz * offsetDist
+    };
+}
+
+/**
+ * Score a box as potential cover: lower is better.
+ * Considers: distance bot must travel, whether the box actually blocks LOS,
+ * and how far the box is from the threat (farther from threat = slightly better).
+ */
+function scoreCoverBox(botPos, threatPos, box) {
+    const cover = getCoverPosition(botPos, threatPos, box);
+
+    // Distance the bot needs to travel to reach cover
+    const travelDx = cover.x - botPos.x;
+    const travelDz = cover.z - botPos.z;
+    const travelDist = Math.sqrt(travelDx * travelDx + travelDz * travelDz);
+
+    // Check if cover position is in bounds
+    if (Math.abs(cover.x) > HALF_ROOM - 1 || Math.abs(cover.z) > HALF_ROOM - 1) {
+        return Infinity; // out of bounds, not viable
+    }
+
+    // Would the box actually block LOS from threat to cover position?
+    const blocked = segmentIntersectsBox(threatPos.x, threatPos.z, cover.x, cover.z, box);
+
+    // Score: travel distance + penalty if it doesn't actually block LOS
+    let score = travelDist;
+    if (!blocked) score += 20; // big penalty — this box won't help
+
+    return score;
+}
+
+/**
+ * When the direct path from bot to cover crosses through the box,
+ * find the best corner of the box to navigate around.
+ * Returns {x, z} of the corner waypoint, or null if path is clear.
+ */
+function getBoxCornerWaypoint(botPos, coverPos, box) {
+    // If direct path doesn't hit the box, no waypoint needed
+    if (!segmentIntersectsBox(botPos.x, botPos.z, coverPos.x, coverPos.z, box)) {
+        return null;
+    }
+
+    // Expanded corners (offset by player radius + clearance so bot won't clip)
+    const margin = PLAYER_RADIUS + 0.6;
+    const halfW = box.w / 2 + margin;
+    const halfD = box.d / 2 + margin;
+
+    const corners = [
+        { x: box.x - halfW, z: box.z - halfD },
+        { x: box.x + halfW, z: box.z - halfD },
+        { x: box.x + halfW, z: box.z + halfD },
+        { x: box.x - halfW, z: box.z + halfD }
+    ];
+
+    // Pick the corner that minimises total detour (bot→corner + corner→cover)
+    // and where the bot→corner segment doesn't cross the box
+    let bestCorner = null;
+    let bestCost = Infinity;
+
+    for (const c of corners) {
+        // Skip if out of arena bounds
+        if (Math.abs(c.x) > HALF_ROOM - 0.5 || Math.abs(c.z) > HALF_ROOM - 0.5) continue;
+
+        // Skip if bot→corner path crosses the box (use un-expanded box for this check)
+        if (segmentIntersectsBox(botPos.x, botPos.z, c.x, c.z, box)) continue;
+
+        const dxB = c.x - botPos.x;
+        const dzB = c.z - botPos.z;
+        const dxC = coverPos.x - c.x;
+        const dzC = coverPos.z - c.z;
+        const cost = Math.sqrt(dxB * dxB + dzB * dzB) + Math.sqrt(dxC * dxC + dzC * dzC);
+
+        if (cost < bestCost) {
+            bestCost = cost;
+            bestCorner = c;
+        }
+    }
+
+    return bestCorner;
+}
+
+/**
+ * Compute a steering avoidance vector so the bot doesn't run head-on into
+ * other players.  Returns a normalised {dx, dz} direction that blends the
+ * original desired direction with a perpendicular dodge away from any
+ * nearby player that is roughly ahead.
+ *
+ * @param {object} bot            The bot being moved
+ * @param {number} wantDx,wantDz  Desired (unnormalised) direction
+ * @param {string|null} threatId  ID of the charged player (extra avoidance)
+ * @param {boolean} isFleeing     True when the bot is in flee mode
+ */
+function steerAvoidPlayers(bot, wantDx, wantDz, threatId, isFleeing) {
+    const AVOID_RADIUS = 3.5;   // start dodging when this close
+    const AVOID_STRENGTH = 2.0;  // base dodge force
+    const THREAT_MULT = 3.0;  // extra dodge weight for the charged player
+
+    const moveLen = Math.sqrt(wantDx * wantDx + wantDz * wantDz) || 1;
+    const fwdX = wantDx / moveLen;
+    const fwdZ = wantDz / moveLen;
+
+    // Perpendicular axis (rotate 90°)
+    const perpX = -fwdZ;
+    const perpZ = fwdX;
+
+    let dodgeX = 0, dodgeZ = 0;
+
+    for (const [, other] of players) {
+        if (other.id === bot.id || !other.alive) continue;
+
+        const dx = other.position.x - bot.position.x;
+        const dz = other.position.z - bot.position.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist >= AVOID_RADIUS || dist < 0.05) continue;
+
+        // Only avoid players that are *ahead* of us (dot > 0)
+        const dot = (dx * fwdX + dz * fwdZ) / dist;
+        if (dot <= 0.1) continue; // behind or beside us — ignore
+
+        // How far off the perpendicular axis is this player?
+        const perpDot = dx * perpX + dz * perpZ;
+
+        // Choose dodge direction: push perpendicular *away* from the player
+        const sign = perpDot > 0 ? -1 : 1;
+
+        // Stronger dodge when closer + when directly ahead
+        const weight = (1 - dist / AVOID_RADIUS) * dot;
+        const mult = (other.id === threatId && isFleeing) ? THREAT_MULT : 1;
+
+        dodgeX += sign * perpX * AVOID_STRENGTH * weight * mult;
+        dodgeZ += sign * perpZ * AVOID_STRENGTH * weight * mult;
+    }
+
+    // Blend: keep original direction + add dodge
+    const rx = fwdX + dodgeX;
+    const rz = fwdZ + dodgeZ;
+    const rLen = Math.sqrt(rx * rx + rz * rz) || 1;
+    return { dx: rx / rLen, dz: rz / rLen };
+}
+
 function updateBots(dt) {
     const BOT_SPEED = 6;
     const FLEE_SPEED = 9;
+    const COVER_ARRIVE_THRESHOLD = 1.2;
 
     for (const bot of bots) {
         // Handle bot respawn
@@ -496,26 +656,108 @@ function updateBots(dt) {
         }
 
         let fleeing = false;
+
         if (chargedPlayerId && chargedPlayerId !== bot.id) {
             const chargedPlayer = players.get(chargedPlayerId);
             if (chargedPlayer && chargedPlayer.alive) {
                 const chargePct = chargeTimer / chargeDuration;
-                const dx = chargedPlayer.position.x - bot.position.x;
-                const dz = chargedPlayer.position.z - bot.position.z;
-                const dist = Math.sqrt(dx * dx + dz * dz);
+                const threatDx = chargedPlayer.position.x - bot.position.x;
+                const threatDz = chargedPlayer.position.z - bot.position.z;
+                const threatDist = Math.sqrt(threatDx * threatDx + threatDz * threatDz);
 
-                if (dist < 14 && chargePct > 0.5) {
-                    const len = dist || 1;
-                    bot.position.x -= (dx / len) * FLEE_SPEED * dt;
-                    bot.position.z -= (dz / len) * FLEE_SPEED * dt;
-                    bot.rotation = Math.atan2(-dx / len, -dz / len);
+                // React as soon as charge starts building — the beam can
+                // target anyone on the entire arena, so distance doesn't gate
+                // the reaction.  Urgency scales with chargePct instead.
+                const reactThreshold = 0.15;
+
+                if (chargePct > reactThreshold) {
                     fleeing = true;
+
+                    const alreadyHidden = !hasLineOfSight(chargedPlayer.position, bot.position);
+
+                    if (alreadyHidden) {
+                        // Safe behind cover — hold with jitter
+                        const len = threatDist || 1;
+                        bot.rotation = Math.atan2(-threatDx / len, -threatDz / len);
+                        const jitterAngle = Math.sin(Date.now() * 0.003 + bot.id.charCodeAt(4)) * 0.3;
+                        bot.position.x += Math.cos(jitterAngle) * 0.5 * dt;
+                        bot.position.z += Math.sin(jitterAngle) * 0.5 * dt;
+                    } else {
+                        // Find a box to hide behind, penalising boxes that
+                        // require running toward the charged player
+                        let bestBox = null;
+                        let bestScore = Infinity;
+
+                        for (const box of arenaBoxes) {
+                            let score = scoreCoverBox(bot.position, chargedPlayer.position, box);
+
+                            // Extra penalty: would the path to this box bring us
+                            // closer to the charged player?
+                            const cover = getCoverPosition(bot.position, chargedPlayer.position, box);
+                            const pathDx = cover.x - bot.position.x;
+                            const pathDz = cover.z - bot.position.z;
+                            const pathLen = Math.sqrt(pathDx * pathDx + pathDz * pathDz) || 1;
+                            // Dot product of path direction and threat direction
+                            const towardsThreat = (pathDx * threatDx + pathDz * threatDz) / (pathLen * (threatDist || 1));
+                            if (towardsThreat > 0.3) {
+                                score += towardsThreat * 15; // penalise running toward threat
+                            }
+
+                            if (score < bestScore) {
+                                bestScore = score;
+                                bestBox = box;
+                            }
+                        }
+
+                        if (bestBox && bestScore < 40) {
+                            const cover = getCoverPosition(bot.position, chargedPlayer.position, bestBox);
+                            const waypoint = getBoxCornerWaypoint(bot.position, cover, bestBox);
+                            const moveTarget = waypoint || cover;
+
+                            const rawDx = moveTarget.x - bot.position.x;
+                            const rawDz = moveTarget.z - bot.position.z;
+                            const rawDist = Math.sqrt(rawDx * rawDx + rawDz * rawDz);
+
+                            if (rawDist > COVER_ARRIVE_THRESHOLD) {
+                                // Apply player avoidance steering
+                                const steered = steerAvoidPlayers(bot, rawDx, rawDz, chargedPlayerId, true);
+                                // Scale: calm reposition at low charge → panicked sprint at high
+                                const speed = FLEE_SPEED * (0.6 + chargePct * 0.7);
+                                bot.position.x += steered.dx * speed * dt;
+                                bot.position.z += steered.dz * speed * dt;
+                                bot.rotation = Math.atan2(steered.dx, steered.dz);
+                            } else if (!waypoint) {
+                                const len = threatDist || 1;
+                                bot.rotation = Math.atan2(-threatDx / len, -threatDz / len);
+                            }
+                        } else {
+                            // No good cover — flee directly with avoidance
+                            const steered = steerAvoidPlayers(bot, -threatDx, -threatDz, chargedPlayerId, true);
+                            const fleeSpd = FLEE_SPEED * (0.6 + chargePct * 0.7);
+                            bot.position.x += steered.dx * fleeSpd * dt;
+                            bot.position.z += steered.dz * fleeSpd * dt;
+                            bot.rotation = Math.atan2(steered.dx, steered.dz);
+                        }
+                    }
                 }
             }
         }
 
+        // If this bot IS the charged player, chase nearest visible target with avoidance
+        if (!fleeing && chargedPlayerId === bot.id) {
+            const { target, distance } = nearestAlive(bot);
+            if (target && distance < 25) {
+                const dx = target.position.x - bot.position.x;
+                const dz = target.position.z - bot.position.z;
+                const steered = steerAvoidPlayers(bot, dx, dz, null, false);
+                bot.position.x += steered.dx * BOT_SPEED * dt;
+                bot.position.z += steered.dz * BOT_SPEED * dt;
+                bot.rotation = Math.atan2(steered.dx, steered.dz);
+                fleeing = true;
+            }
+        }
+
         if (!fleeing) {
-            // Try to seek a nearby power-up if bot has no shield
             let seekingPowerUp = false;
             if (bot.defenseShield <= 0 && powerUps.length > 0) {
                 let nearestPU = null;
@@ -531,9 +773,10 @@ function updateBots(dt) {
                     const dz = nearestPU.z - bot.position.z;
                     const dist = Math.sqrt(dx * dx + dz * dz);
                     if (dist > 0.5) {
-                        bot.position.x += (dx / dist) * BOT_SPEED * dt;
-                        bot.position.z += (dz / dist) * BOT_SPEED * dt;
-                        bot.rotation = Math.atan2(dx / dist, dz / dist);
+                        const steered = steerAvoidPlayers(bot, dx, dz, chargedPlayerId, false);
+                        bot.position.x += steered.dx * BOT_SPEED * dt;
+                        bot.position.z += steered.dz * BOT_SPEED * dt;
+                        bot.rotation = Math.atan2(steered.dx, steered.dz);
                         seekingPowerUp = true;
                     }
                 }
@@ -542,9 +785,19 @@ function updateBots(dt) {
             if (!seekingPowerUp) {
                 bot.moveTimer -= dt;
                 if (bot.moveTimer <= 0) {
-                    bot.targetX = (Math.random() - 0.5) * 34;
-                    bot.targetZ = (Math.random() - 0.5) * 34;
-                    bot.moveTimer = 2 + Math.random() * 4;
+                    if (Math.random() < 0.6 && arenaBoxes.length > 0) {
+                        const box = arenaBoxes[Math.floor(Math.random() * arenaBoxes.length)];
+                        const angle = Math.random() * Math.PI * 2;
+                        const offset = (BOX_SIZE / 2) + PLAYER_RADIUS + 1 + Math.random() * 2;
+                        bot.targetX = box.x + Math.cos(angle) * offset;
+                        bot.targetZ = box.z + Math.sin(angle) * offset;
+                    } else {
+                        bot.targetX = (Math.random() - 0.5) * 34;
+                        bot.targetZ = (Math.random() - 0.5) * 34;
+                    }
+                    bot.targetX = Math.max(-HALF_ROOM + 1, Math.min(HALF_ROOM - 1, bot.targetX));
+                    bot.targetZ = Math.max(-HALF_ROOM + 1, Math.min(HALF_ROOM - 1, bot.targetZ));
+                    bot.moveTimer = 2 + Math.random() * 3;
                 }
 
                 const dx = bot.targetX - bot.position.x;
@@ -552,9 +805,10 @@ function updateBots(dt) {
                 const dist = Math.sqrt(dx * dx + dz * dz);
 
                 if (dist > 0.5) {
-                    bot.position.x += (dx / dist) * BOT_SPEED * dt;
-                    bot.position.z += (dz / dist) * BOT_SPEED * dt;
-                    bot.rotation = Math.atan2(dx / dist, dz / dist);
+                    const steered = steerAvoidPlayers(bot, dx, dz, chargedPlayerId, false);
+                    bot.position.x += steered.dx * BOT_SPEED * dt;
+                    bot.position.z += steered.dz * BOT_SPEED * dt;
+                    bot.rotation = Math.atan2(steered.dx, steered.dz);
                 }
             }
         }

@@ -276,7 +276,8 @@ export class PlayerModel {
         }
 
         // This player IS the charged one — transition ground circle blue → red
-        if (this._localIndicator) {
+        // Only show the indicator on the LOCAL player model (remote players don't get circles)
+        if (this._localIndicator && this._isLocalPlayer) {
             this._localIndicator.visible = true;
             // Lerp color: blue(0x2299ff) → orange(0xff6600) → red(0xff2244)
             PlayerModel._tmpColorA.copy(this._indicatorBaseColor); // blue
