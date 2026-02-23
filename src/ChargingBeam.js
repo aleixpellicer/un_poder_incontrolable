@@ -6,6 +6,7 @@ import * as THREE from 'three';
  * - TAPERED: wider & brighter at the shooter, thinner & dimmer at the target.
  * - Grows in opacity / thickness as charge % increases.
  * - Uses a custom shader for smooth opacity gradient along the beam.
+ * - Electric lightning arcs crackle along the beam path.
  */
 
 /* ── Gradient shader ──────────────────────────── */
@@ -53,7 +54,6 @@ export class ChargingBeam {
         this.active = false;
 
         /* ── Core beam (inner) — tapered ───────── */
-        // radiusTop = target end (wide), radiusBottom = shooter end (thin)
         this.beamGeo = new THREE.CylinderGeometry(0.08, 0.02, 1, 8, 1, true);
         this.beamMat = makeBeamMaterial(0x00ffc8);
         this.beam = new THREE.Mesh(this.beamGeo, this.beamMat);
@@ -102,6 +102,12 @@ export class ChargingBeam {
         this.originGlow = new THREE.Mesh(originGeo, originMat);
         this.group.add(this.originGlow);
 
+        /* ── Lightning arcs container ──────────── */
+        this.lightningGroup = new THREE.Group();
+        this.group.add(this.lightningGroup);
+        this._lightningLines = [];
+        this._lightningTimer = 0;
+
         this.group.visible = false;
     }
 
@@ -149,14 +155,12 @@ export class ChargingBeam {
         const pulse = pct > 0.6 ? 1 + Math.sin(t * 6 + pct * 10) * 0.3 * pct : 1;
 
         /* ── Inner beam ────────────────────────── */
-        // Width scale grows with charge (tapered shape is baked in geometry)
         const innerScale = (0.5 + pct * 1.5) * pulse;
         this.beam.scale.set(innerScale, length, innerScale);
         this.beam.position.copy(midpoint);
         this.beam.quaternion.copy(orient);
         this.beamMat.uniforms.uOpacity.value = (0.06 + pct * 0.55) * pulse;
         this.beamMat.uniforms.uColor.value.copy(beamColor);
-        // Gradient gets slightly less harsh as charge builds (beam becomes more "solid")
         this.beamMat.uniforms.uGradientStrength.value = 0.90 - pct * 0.25;
 
         /* ── Outer glow ────────────────────────── */
@@ -178,13 +182,12 @@ export class ChargingBeam {
         this.haloMat.uniforms.uGradientStrength.value = 0.95 - pct * 0.15;
 
         /* ── Light — positioned closer to target end ── */
-        // Place light 70% from the shooter toward the target
         const lightPos = new THREE.Vector3().lerpVectors(fromPos, toPos, 0.7);
         this.light.position.copy(lightPos);
         this.light.intensity = pct * 2.5 * pulse;
         this.light.color.copy(beamColor);
 
-        /* ── Target ring — prominent (beam is intense here) ── */
+        /* ── Target ring ───────────────────────── */
         this.targetRing.position.copy(toPos);
         this.targetRing.position.y = 0.1;
         this.targetRing.material.opacity = (0.05 + pct * 0.6) * pulse;
@@ -193,17 +196,145 @@ export class ChargingBeam {
         this.targetRing.scale.setScalar(ringScale);
         this.targetRing.rotation.z = t * 2;
 
-        /* ── Origin glow — subtle at shooter ───── */
+        /* ── Origin glow ───────────────────────── */
         this.originGlow.position.copy(fromPos);
         this.originGlow.material.opacity = (0.03 + pct * 0.25) * pulse;
         this.originGlow.material.color.copy(beamColor);
         const originScale = (0.2 + pct * 0.4) * pulse;
         this.originGlow.scale.setScalar(originScale);
+
+        /* ── Lightning arcs ────────────────────── */
+        this._updateLightning(fromPos, toPos, pct, beamColor, t);
+    }
+
+    /**
+     * Generate procedural lightning arcs along the beam path.
+     * Arcs are regenerated frequently for a flickering, electric look.
+     */
+    _updateLightning(fromPos, toPos, pct, beamColor, t) {
+        // Refresh rate increases with charge
+        const refreshInterval = pct > 0.7 ? 0.03 : pct > 0.4 ? 0.06 : 0.12;
+        this._lightningTimer += 0.016; // ~60fps tick
+
+        if (this._lightningTimer < refreshInterval) return;
+        this._lightningTimer = 0;
+
+        // Clear old lightning
+        for (const line of this._lightningLines) {
+            this.lightningGroup.remove(line);
+            line.geometry.dispose();
+            line.material.dispose();
+        }
+        this._lightningLines.length = 0;
+
+        // Don't show lightning at very low charge  
+        if (pct < 0.1) return;
+
+        // Number of arcs scales with charge
+        const arcCount = Math.floor(2 + pct * 6);
+        const dir = new THREE.Vector3().subVectors(toPos, fromPos);
+        const length = dir.length();
+        const dirNorm = dir.clone().normalize();
+
+        // Build perpendicular axes for offset
+        const up = new THREE.Vector3(0, 1, 0);
+        let perp1 = new THREE.Vector3().crossVectors(dirNorm, up);
+        if (perp1.lengthSq() < 0.001) perp1 = new THREE.Vector3().crossVectors(dirNorm, new THREE.Vector3(1, 0, 0));
+        perp1.normalize();
+        const perp2 = new THREE.Vector3().crossVectors(dirNorm, perp1).normalize();
+
+        for (let a = 0; a < arcCount; a++) {
+            const points = this._generateArc(fromPos, toPos, dirNorm, perp1, perp2, length, pct);
+
+            // Primary arc line
+            const geo = new THREE.BufferGeometry().setFromPoints(points);
+            const lineWidth = 0.5 + pct * 2;
+            const opacity = (0.2 + pct * 0.7) * (0.6 + Math.random() * 0.4);
+            const mat = new THREE.LineBasicMaterial({
+                color: beamColor.clone().lerp(new THREE.Color(0xffffff), 0.3 + Math.random() * 0.3),
+                transparent: true,
+                opacity: opacity,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+                linewidth: lineWidth
+            });
+            const line = new THREE.Line(geo, mat);
+            this.lightningGroup.add(line);
+            this._lightningLines.push(line);
+
+            // Small branch arcs at higher charges
+            if (pct > 0.4 && Math.random() < pct * 0.6) {
+                const branchIdx = Math.floor(Math.random() * (points.length - 2)) + 1;
+                const branchStart = points[branchIdx];
+                const branchLen = (0.3 + Math.random() * 0.8) * pct;
+                const branchDir = new THREE.Vector3(
+                    (Math.random() - 0.5) * 2,
+                    (Math.random() - 0.5) * 2,
+                    (Math.random() - 0.5) * 2
+                ).normalize();
+
+                const branchPoints = [branchStart.clone()];
+                const branchSegs = 3 + Math.floor(Math.random() * 3);
+                for (let s = 1; s <= branchSegs; s++) {
+                    const frac = s / branchSegs;
+                    const pt = branchStart.clone().add(branchDir.clone().multiplyScalar(branchLen * frac));
+                    pt.add(new THREE.Vector3(
+                        (Math.random() - 0.5) * branchLen * 0.3,
+                        (Math.random() - 0.5) * branchLen * 0.3,
+                        (Math.random() - 0.5) * branchLen * 0.3
+                    ));
+                    branchPoints.push(pt);
+                }
+
+                const bGeo = new THREE.BufferGeometry().setFromPoints(branchPoints);
+                const bMat = new THREE.LineBasicMaterial({
+                    color: beamColor.clone().lerp(new THREE.Color(0xffffff), 0.5),
+                    transparent: true,
+                    opacity: opacity * 0.6,
+                    depthWrite: false,
+                    blending: THREE.AdditiveBlending
+                });
+                const bLine = new THREE.Line(bGeo, bMat);
+                this.lightningGroup.add(bLine);
+                this._lightningLines.push(bLine);
+            }
+        }
+    }
+
+    /** Generate a single jagged arc between two points */
+    _generateArc(from, to, dirNorm, perp1, perp2, length, pct) {
+        const segments = 8 + Math.floor(pct * 10); // more jagged at high charge
+        const jitter = (0.1 + pct * 0.5); // jitter amplitude grows with charge
+        const points = [];
+
+        for (let i = 0; i <= segments; i++) {
+            const frac = i / segments;
+            const basePoint = new THREE.Vector3().lerpVectors(from, to, frac);
+
+            // No jitter on endpoints
+            if (i > 0 && i < segments) {
+                const offset1 = (Math.random() - 0.5) * 2 * jitter;
+                const offset2 = (Math.random() - 0.5) * 2 * jitter;
+                basePoint.add(perp1.clone().multiplyScalar(offset1));
+                basePoint.add(perp2.clone().multiplyScalar(offset2));
+            }
+
+            points.push(basePoint);
+        }
+
+        return points;
     }
 
     hide() {
         this.group.visible = false;
         this.active = false;
+        // Clean up lightning
+        for (const line of this._lightningLines) {
+            this.lightningGroup.remove(line);
+            line.geometry.dispose();
+            line.material.dispose();
+        }
+        this._lightningLines.length = 0;
     }
 
     dispose() {

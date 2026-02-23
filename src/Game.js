@@ -19,6 +19,7 @@ export class Game {
         this.effects = [];              // PowerEffect[]
         this.chargingBeam = null;       // ChargingBeam (live preview)
         this.chargeState = { chargedPlayerId: null, chargePct: 0 };
+        this._isTargeted = false;       // whether local player is the nearest target
         this.clock = new THREE.Clock();
         this.sendAcc = 0;
 
@@ -202,6 +203,7 @@ export class Game {
             ? PlayerModel.loadFromCache(data.color, this.cachedAssets)
             : await PlayerModel.load(data.color);
         model.setName(data.name);
+        model.setAlive(data.alive);
         this.scene.scene.add(model.mesh);
         model.mesh.position.set(data.position.x, data.position.y, data.position.z);
         this.remotes.set(id, { model, targetPos: null, data, prevPos: null });
@@ -389,6 +391,8 @@ export class Game {
         // Charging beam preview
         if (this.chargingBeam && this.matchState === 'playing') {
             const { chargedPlayerId, chargePct } = this.chargeState;
+            let localIsTargeted = false;
+
             if (chargedPlayerId && chargePct > 0 && chargePct < 1) {
                 let chargedPos = null;
                 if (chargedPlayerId === this.localId && this.ctrl) {
@@ -401,6 +405,7 @@ export class Game {
                 if (chargedPos) {
                     let nearestPos = null;
                     let nearestDist = Infinity;
+                    let nearestIsLocal = false;
 
                     for (const [id, r] of this.remotes) {
                         if (id === chargedPlayerId) continue;
@@ -413,6 +418,7 @@ export class Game {
                         if (dist < nearestDist) {
                             nearestDist = dist;
                             nearestPos = pos.clone();
+                            nearestIsLocal = false;
                         }
                     }
 
@@ -425,6 +431,7 @@ export class Game {
                             if (dist < nearestDist) {
                                 nearestDist = dist;
                                 nearestPos = pos.clone();
+                                nearestIsLocal = true;
                             }
                         }
                     }
@@ -435,6 +442,11 @@ export class Game {
                         const to = nearestPos.clone();
                         to.y += 1.0;
                         this.chargingBeam.update(from, to, chargePct);
+
+                        // Detect if local player is the target
+                        if (nearestIsLocal && chargedPlayerId !== this.localId) {
+                            localIsTargeted = true;
+                        }
                     } else {
                         this.chargingBeam.hide();
                     }
@@ -444,8 +456,24 @@ export class Game {
             } else {
                 this.chargingBeam.hide();
             }
+
+            // Update targeted warning state
+            if (localIsTargeted && !this._isTargeted) {
+                this._isTargeted = true;
+                this.hud.showTargetedWarning(chargePct);
+            } else if (localIsTargeted && this._isTargeted) {
+                this.hud.showTargetedWarning(chargePct);
+            } else if (!localIsTargeted && this._isTargeted) {
+                this._isTargeted = false;
+                this.hud.hideTargetedWarning();
+            }
+
         } else if (this.chargingBeam) {
             this.chargingBeam.hide();
+            if (this._isTargeted) {
+                this._isTargeted = false;
+                this.hud.hideTargetedWarning();
+            }
         }
 
         this.scene.render();

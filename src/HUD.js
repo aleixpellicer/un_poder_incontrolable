@@ -18,6 +18,7 @@ export class HUD {
         this.eliminatedScreen = document.getElementById('eliminated-screen');
         this.eliminatedPlacement = document.getElementById('eliminated-placement');
         this.eliminatedKiller = document.getElementById('eliminated-killer');
+        this.targetedWarning = document.getElementById('targeted-warning');
         this._msgTimer = null;
     }
 
@@ -153,6 +154,28 @@ export class HUD {
         this.messageBox.style.opacity = 1;
         clearTimeout(this._msgTimer);
         this._msgTimer = setTimeout(() => { this.messageBox.style.opacity = 0; }, duration);
+    }
+
+    /* ── Targeted warning ─────────────────── */
+    showTargetedWarning(chargePct) {
+        if (!this.targetedWarning) return;
+        this.targetedWarning.style.display = 'flex';
+
+        if (chargePct > 0.75) {
+            this.targetedWarning.textContent = '⚡ ¡CORRE! ¡VAS A SER ELIMINADO! ⚡';
+            this.targetedWarning.className = 'targeted-critical';
+        } else if (chargePct > 0.4) {
+            this.targetedWarning.textContent = '⚠ ¡ERES EL OBJETIVO! ¡ALÉJATE! ⚠';
+            this.targetedWarning.className = 'targeted-danger';
+        } else {
+            this.targetedWarning.textContent = '⚠ ¡Te están apuntando! Muévete';
+            this.targetedWarning.className = 'targeted-warning';
+        }
+    }
+
+    hideTargetedWarning() {
+        if (!this.targetedWarning) return;
+        this.targetedWarning.style.display = 'none';
     }
 
     updateScoreboard(players) {

@@ -168,36 +168,54 @@ export class PlayerModel {
         pct = Math.min(Math.max(pct, 0), 1);
 
         if (!isCharged) {
-            // Not the charged player — hide ring, neutral glow
+            // Not the charged player — hide ring, neutral glow, restore materials
             this.ring.visible = false;
             this.ring.material.opacity = 0;
             this.glow.intensity = 0.5;
             this.glow.color.copy(this.color);
+            this._setEmissiveTint(this.color, 0.2);
             return;
         }
 
-        // This player IS the charged one — show ring
+        // This player IS the charged one — ATTACKER: red glow!
         this.ring.visible = true;
-        this.ring.material.opacity = 0.1 + pct * 0.8;
+        this.ring.material.opacity = 0.2 + pct * 0.8;
 
-        if (pct < 0.5) {
-            this.ring.material.color.setHex(0x00ff88);
-        } else if (pct < 0.8) {
-            this.ring.material.color.setHex(0xffcc00);
-        } else {
-            this.ring.material.color.setHex(0xff2244);
-        }
+        // Ring is always red/orange when charged (attacker is dangerous)
+        const ringColor = new THREE.Color(0xff2244).lerp(new THREE.Color(0xff6600), 0.3 - pct * 0.3);
+        this.ring.material.color.copy(ringColor);
 
-        if (pct > 0.85) {
-            const pulse = 1 + Math.sin(performance.now() * 0.012) * 0.25;
-            this.ring.scale.setScalar(pulse);
-            this.glow.intensity = 0.6 + Math.sin(performance.now() * 0.015) * 0.4;
-            this.glow.color.setHex(0xff2244);
-        } else {
-            this.ring.scale.setScalar(1);
-            this.glow.intensity = 0.5;
-            this.glow.color.copy(this.color);
-        }
+        // Pulsing ring
+        const pulse = 1 + Math.sin(performance.now() * 0.012 * (1 + pct * 2)) * (0.1 + pct * 0.25);
+        this.ring.scale.setScalar(pulse);
+
+        // Red glowing light — intensity increases with charge
+        const glowIntensity = 1.0 + pct * 3.0;
+        const flickerIntensity = Math.sin(performance.now() * 0.015) * 0.5 * pct;
+        this.glow.intensity = glowIntensity + flickerIntensity;
+        this.glow.color.setHex(0xff2244);
+        this.glow.distance = 8 + pct * 6; // farther red glow reach
+
+        // Tint the character model emissive RED
+        const emissiveColor = new THREE.Color(0xff1133);
+        const emissiveStrength = 0.3 + pct * 0.7; // gets more intense
+        this._setEmissiveTint(emissiveColor, emissiveStrength);
+    }
+
+    /** Set emissive tint on all character meshes */
+    _setEmissiveTint(color, intensity) {
+        if (!this._fbx) return;
+        this._fbx.traverse((child) => {
+            if (child.isMesh && child.material) {
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+                for (const m of mats) {
+                    if (m.emissive) {
+                        m.emissive.copy(color).multiplyScalar(intensity);
+                        m.emissiveIntensity = intensity;
+                    }
+                }
+            }
+        });
     }
 
     setAlive(alive) { this.mesh.visible = alive; }
