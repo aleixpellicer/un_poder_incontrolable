@@ -133,11 +133,11 @@ export class HUD {
 
             if (pct >= 90) {
                 this.chargeBar.style.background = 'linear-gradient(90deg,#ff2244,#ff6644)';
-                this.chargeLabel.textContent = '⚡ INMINENTE ⚡';
+                this.chargeLabel.textContent = '⚡ ¡MATA O MUERES! ⚡';
                 this.chargeLabel.style.color = '#ff4466';
             } else if (pct >= 50) {
                 this.chargeBar.style.background = 'linear-gradient(90deg,#ffaa00,#ffee00)';
-                this.chargeLabel.textContent = 'CARGANDO ' + Math.round(pct) + '%';
+                this.chargeLabel.textContent = '¡ELIMINA O MUERES! ' + Math.round(pct) + '%';
                 this.chargeLabel.style.color = '#ffcc00';
             } else {
                 this.chargeBar.style.background = 'linear-gradient(90deg,#00ffc8,#00aaff)';

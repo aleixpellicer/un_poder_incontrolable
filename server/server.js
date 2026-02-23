@@ -734,6 +734,8 @@ function tick() {
 
             if (chargeTimer >= chargeDuration) {
                 const { target, distance } = nearestAlive(chargedPlayer);
+                let killedTarget = false;
+
                 if (target) {
                     // Check if target has a defense shield
                     if (target.defenseShield > 0) {
@@ -744,7 +746,7 @@ function tick() {
                             shooterId: chargedPlayer.id, shooterName: chargedPlayer.name,
                             targetId: target.id, targetName: target.name,
                             shooterPos: { ...chargedPlayer.position }, targetPos: { ...target.position },
-                            killed: false, shieldBlocked: true, distance
+                            killed: false, shieldBlocked: true, selfDestruct: false, distance
                         });
 
                         // Notify the shielded player
@@ -757,6 +759,7 @@ function tick() {
                         console.log(`  🛡️  ${target.name}'s shield blocked ${chargedPlayer.name}'s beam!`);
                     } else {
                         // Kill — but they can respawn!
+                        killedTarget = true;
                         // Record survival time before death
                         target.survivalTime = (now - target.aliveStartTime) / 1000;
                         if (target.survivalTime > target.bestSurvivalTime) {
@@ -773,7 +776,7 @@ function tick() {
                             shooterId: chargedPlayer.id, shooterName: chargedPlayer.name,
                             targetId: target.id, targetName: target.name,
                             shooterPos: { ...chargedPlayer.position }, targetPos: { ...target.position },
-                            killed: true, shieldBlocked: false, distance
+                            killed: true, shieldBlocked: false, selfDestruct: false, distance
                         });
 
                         // Notify killed player
@@ -785,6 +788,36 @@ function tick() {
                             });
                         }
                     }
+                }
+
+                // If the charged player failed to kill anyone, they self-destruct!
+                if (!killedTarget) {
+                    chargedPlayer.survivalTime = (now - chargedPlayer.aliveStartTime) / 1000;
+                    if (chargedPlayer.survivalTime > chargedPlayer.bestSurvivalTime) {
+                        chargedPlayer.bestSurvivalTime = chargedPlayer.survivalTime;
+                    }
+
+                    chargedPlayer.alive = false;
+                    chargedPlayer.respawnTimer = RESPAWN_COOLDOWN;
+                    chargedPlayer.deaths++;
+
+                    powerEvents.push({
+                        shooterId: chargedPlayer.id, shooterName: chargedPlayer.name,
+                        targetId: chargedPlayer.id, targetName: chargedPlayer.name,
+                        shooterPos: { ...chargedPlayer.position }, targetPos: { ...chargedPlayer.position },
+                        killed: false, shieldBlocked: false, selfDestruct: true, distance: 0
+                    });
+
+                    // Notify the self-destructed player
+                    if (!chargedPlayer.isBot) {
+                        io.to(chargedPlayer.id).emit('killed', {
+                            killedBy: '💥 AUTO-DESTRUCCIÓN',
+                            survivalTime: Math.floor(chargedPlayer.survivalTime),
+                            respawnIn: RESPAWN_COOLDOWN
+                        });
+                    }
+
+                    console.log(`  💥 ${chargedPlayer.name} self-destructed (failed to kill)!`);
                 }
 
                 lastChargedPlayerId = chargedPlayerId;

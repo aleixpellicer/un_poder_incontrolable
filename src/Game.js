@@ -464,34 +464,56 @@ export class Game {
         // Power events — beam effect
         if (state.powerEvents) {
             for (const ev of state.powerEvents) {
-                const from = new THREE.Vector3(ev.shooterPos.x, ev.shooterPos.y + 1.5, ev.shooterPos.z);
-                const to = new THREE.Vector3(ev.targetPos.x, ev.targetPos.y + 1, ev.targetPos.z);
-                const color = ev.shooterId === this.localId ? '#00ffc8' : '#ff4466';
-                const fx = new PowerEffect(from, to, color);
-                this.scene.scene.add(fx.group);
-                this.effects.push(fx);
+                if (ev.selfDestruct) {
+                    // Self-destruct: explosion on the charged player
+                    const selfPos = new THREE.Vector3(ev.shooterPos.x, ev.shooterPos.y + 1, ev.shooterPos.z);
+                    const selfPosUp = selfPos.clone();
+                    selfPosUp.y += 1.5;
+                    const fx = new PowerEffect(selfPosUp, selfPos, '#ff2244');
+                    this.scene.scene.add(fx.group);
+                    this.effects.push(fx);
 
-                const isLocal = ev.shooterId === this.localId || ev.targetId === this.localId;
-                this.scene.shake(
-                    isLocal ? 0.7 : 0.35,
-                    isLocal ? 0.5 : 0.3
-                );
+                    const isLocal = ev.shooterId === this.localId;
+                    this.scene.shake(
+                        isLocal ? 0.8 : 0.4,
+                        isLocal ? 0.6 : 0.3
+                    );
 
-                if (ev.shieldBlocked) {
-                    // Shield block — different visual/messages
-                    if (ev.targetId === this.localId) {
-                        this.hud.showMessage(`🛡️ ¡Tu escudo absorbió el rayo de ${ev.shooterName}!`, 3000);
-                    } else if (ev.shooterId === this.localId) {
-                        this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó tu rayo con su escudo`, 2500);
+                    if (isLocal) {
+                        this.hud.showMessage('💥 ¡AUTO-DESTRUCCIÓN! ¡No eliminaste a nadie!', 3000);
                     } else {
-                        this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó el rayo con su escudo`, 2000);
+                        this.hud.showMessage(`💥 ${ev.shooterName} se autodestruyó (no eliminó a nadie)`, 2500);
                     }
-                } else if (ev.targetId === this.localId) {
-                    this.hud.showMessage(`⚡ ¡ELIMINADO por ${ev.shooterName}!`, 2500);
-                } else if (ev.shooterId === this.localId) {
-                    this.hud.showMessage(`⚡ ¡RAYO eliminó a ${ev.targetName}!`, 2000);
                 } else {
-                    this.hud.showMessage(`💀 ${ev.targetName} eliminado por ${ev.shooterName}`, 2000);
+                    const from = new THREE.Vector3(ev.shooterPos.x, ev.shooterPos.y + 1.5, ev.shooterPos.z);
+                    const to = new THREE.Vector3(ev.targetPos.x, ev.targetPos.y + 1, ev.targetPos.z);
+                    const color = ev.shooterId === this.localId ? '#00ffc8' : '#ff4466';
+                    const fx = new PowerEffect(from, to, color);
+                    this.scene.scene.add(fx.group);
+                    this.effects.push(fx);
+
+                    const isLocal = ev.shooterId === this.localId || ev.targetId === this.localId;
+                    this.scene.shake(
+                        isLocal ? 0.7 : 0.35,
+                        isLocal ? 0.5 : 0.3
+                    );
+
+                    if (ev.shieldBlocked) {
+                        // Shield block — different visual/messages
+                        if (ev.targetId === this.localId) {
+                            this.hud.showMessage(`🛡️ ¡Tu escudo absorbió el rayo de ${ev.shooterName}!`, 3000);
+                        } else if (ev.shooterId === this.localId) {
+                            this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó tu rayo con su escudo`, 2500);
+                        } else {
+                            this.hud.showMessage(`🛡️ ${ev.targetName} bloqueó el rayo con su escudo`, 2000);
+                        }
+                    } else if (ev.targetId === this.localId) {
+                        this.hud.showMessage(`⚡ ¡ELIMINADO por ${ev.shooterName}!`, 2500);
+                    } else if (ev.shooterId === this.localId) {
+                        this.hud.showMessage(`⚡ ¡RAYO eliminó a ${ev.targetName}!`, 2000);
+                    } else {
+                        this.hud.showMessage(`💀 ${ev.targetName} eliminado por ${ev.shooterName}`, 2000);
+                    }
                 }
             }
         }
